@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+debug-json/
+dev-json/
+.env

@@ -56,3 +56,26 @@ injection-tool の管理画面 → MCP管理 で以下を設定:
 # Node.js環境がある場合
 npx @modelcontextprotocol/inspector .venv\Scripts\python server.py
 ```
+
+## 処理フロー
+
+通常の Web 検索と、サイトクロール構造化は別フローで動きます。
+
+~~~mermaid
+flowchart TD
+    A[search_web呼び出し] --> B[DuckDuckGo HTML取得]
+    B --> C[検索結果抽出]
+    C --> D[日本語優先で並べ替え]
+    D --> E[上位3件を選定]
+    E --> F[各URLをfetch_urlで要約取得]
+    F --> G[JSONで返却]
+
+    H[crawl_site呼び出し] --> I[サイト内リンクを巡回]
+    I --> J[ページ本文抽出]
+    J --> K[ページ種別判定: content/list/form/navigation/system]
+    K --> L[共通テキスト除去]
+    L --> M[_build_blockで構造化]
+    M --> N[_normalize_page_title適用]
+    N --> O[role/label/priority付与]
+    O --> P[blocks + metaをJSON返却]
+~~~

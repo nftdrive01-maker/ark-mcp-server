@@ -4,17 +4,27 @@ Fetch MCP サーバー
 """
 
 import json
+import logging
 import os
 import re
 import urllib.request
 import urllib.parse
+import html
 from html.parser import HTMLParser
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+# .env を自動読み込み（同名の実環境変数は上書きしない）
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # FastMCP インスタンスを作成
 mcp = FastMCP("fetch-server", host="0.0.0.0", port=8000)
+
+_LOGGER = logging.getLogger("fetch_server")
 
 
 # ─── 言語検出とフィルタリング ────────────────────────────────────────
@@ -62,9 +72,7 @@ def _normalize_page_title(title: str, site_name: str = "") -> str:
     if site_name:
         site_patterns = [
             re.escape(site_name),
-            re.escape(site_name.replace("　", " ")),
-            r'洛陽総合高等学校',
-            r'らくよう\s*そうごう',
+            re.escape(site_name.replace("　", " "))
         ]
         for pattern in site_patterns:
             normalized = re.sub(f'\\s*{pattern}\\s*', ' ', normalized, flags=re.IGNORECASE)
@@ -1565,29 +1573,725 @@ def crawl_site(url: str, max_pages: int = 10, max_length_per_page: int = 2000) -
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _strip_html_tags(text: str) -> str:
+    """HTML?????????????????"""
+    if not text:
+        return ""
+    cleaned = re.sub(r"<[^>]+>", " ", text)
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _fetch_raw_html(url: str, timeout: int = 15) -> str:
+    """URL?????????HTML?????????"""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0 Safari/537.36"
+            ),
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
+
+
+def _normalize_duckduckgo_url(url: str) -> str:
+    """DuckDuckGo???????URL??URL????"""
+    if not url:
+        return ""
+
+    cleaned = html.unescape(url.strip())
+    if cleaned.startswith("//"):
+        cleaned = "https:" + cleaned
+
+    parsed = urllib.parse.urlparse(cleaned)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        params = urllib.parse.parse_qs(parsed.query)
+        for key in ("uddg", "u", "rut"):
+            values = params.get(key)
+            if values and values[0]:
+                return urllib.parse.unquote(values[0])
+
+    return cleaned
+
+
+def _sanitize_search_query(query: str) -> str:
+    """search_web に渡されたクエリを検索向けに正規化する。"""
+    q = (query or "").strip()
+    if not q:
+        return ""
+
+    q = re.sub(r"\[(?:neutral|joyful|sad|angry)\]", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q).strip()
+    q = re.sub(r"^(?:私(?:、|は)?|わたし(?:、|は)?)\s*", "", q)
+
+    intro_topic = re.search(
+        r"^(?:インターネット|web|ウェブ)で([^\n。！？]{1,40}?)(?:を|に関する)",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if intro_topic and intro_topic.group(1).strip():
+        return intro_topic.group(1).strip()
+
+    quoted = re.search(r"[「\"]([^「」\"\n]{2,80})[」\"]", q)
+    if quoted and quoted.group(1).strip():
+        return quoted.group(1).strip()
+
+    tried = re.search(r"([^\n。！？]{2,80}?)を調べ(?:ようとした|ました|た結果)", q)
+    if tried and tried.group(1).strip():
+        return tried.group(1).strip()
+
+    about = re.search(r"([^\n。！？]{2,60}?)に関する(?:情報|知識)", q)
+    if about and about.group(1).strip():
+        return about.group(1).strip()
+
+    web_about = re.search(
+        r"(?:web|ウェブ|インターネット)で([^\n。！？]{1,40}?)に関する(?:情報|知識)を?検索",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if web_about and web_about.group(1).strip():
+        return web_about.group(1).strip()
+
+    if len(q) > 120:
+        sentence = re.split(r"[。！？!?]", q, maxsplit=1)[0].strip()
+        q = sentence or q[:120]
+
+    return q[:120].strip()
+
+
+def _extract_duckduckgo_results(raw_html: str, limit: int = 5) -> list[dict[str, str]]:
+    """DuckDuckGo?HTML????????????"""
+    results: list[dict[str, str]] = []
+    if not raw_html:
+        return results
+
+    title_pattern = re.compile(
+        r'<a\b(?=[^>]*\bclass="[^"]*\bresult__a\b[^"]*")(?=[^>]*\bhref="(?P<href>[^"]+)")[^>]*>(?P<title>.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    matches = list(title_pattern.finditer(raw_html))
+
+    # DuckDuckGo lite 形式の保険
+    if not matches:
+        lite_pattern = re.compile(
+            r'<a\b(?=[^>]*\bclass="[^"]*\bresult-link\b[^"]*")(?=[^>]*\bhref="(?P<href>[^"]+)")[^>]*>(?P<title>.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        matches = list(lite_pattern.finditer(raw_html))
+
+    for index, match in enumerate(matches):
+        if len(results) >= limit:
+            break
+
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(raw_html)
+        chunk = raw_html[match.end():next_start]
+
+        title = _strip_html_tags(match.group("title"))
+        url = _normalize_duckduckgo_url(match.group("href"))
+
+        snippet = ""
+        snippet_match = re.search(
+            r'class="result__snippet"[^>]*>(?P<snippet>.*?)</(?:a|span)>',
+            chunk,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if snippet_match:
+            snippet = _strip_html_tags(snippet_match.group("snippet"))
+
+        if not title and not url and not snippet:
+            continue
+
+        domain = urllib.parse.urlparse(url).netloc if url else ""
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        results.append(
+            {
+                "title": title or url or f"???? {len(results) + 1}",
+                "url": url,
+                "domain": domain,
+                "snippet": snippet,
+            }
+        )
+
+    return results
+
+
+def _is_search_challenge_page(raw_html: str) -> bool:
+    """検索結果ページではなく challenge ページが返っているか判定する。"""
+    if not raw_html:
+        return False
+
+    lowered = raw_html.lower()
+    challenge_markers = (
+        "anomaly",
+        "challenge",
+        "captcha",
+        "unusual traffic",
+        "automated requests",
+    )
+
+    has_marker = any(marker in lowered for marker in challenge_markers)
+    has_result_anchor = (
+        "result__a" in lowered
+        or "result-link" in lowered
+        or "result__snippet" in lowered
+    )
+
+    return has_marker and not has_result_anchor
+
+
+def _search_wikipedia_results(query: str, limit: int = 5) -> list[dict[str, str]]:
+    """検索フォールバック: Wikipedia API から結果候補を取得する。"""
+    results: list[dict[str, str]] = []
+    if not query:
+        return results
+
+    def _fetch(lang: str) -> list[dict[str, str]]:
+        api_url = (
+            f"https://{lang}.wikipedia.org/w/api.php"
+            f"?action=query&list=search&srsearch={urllib.parse.quote_plus(query)}"
+            f"&format=json&utf8=1&srlimit={max(1, min(limit, 10))}"
+        )
+        raw = _fetch_raw_html(api_url, timeout=12)
+        data = json.loads(raw)
+        search_items = (data.get("query", {}) or {}).get("search", []) or []
+
+        fetched: list[dict[str, str]] = []
+        for item in search_items:
+            title = _strip_html_tags(str(item.get("title", "")))
+            snippet = _strip_html_tags(str(item.get("snippet", "")))
+            if not title:
+                continue
+
+            page_path = urllib.parse.quote(title.replace(" ", "_"), safe="()")
+            url = f"https://{lang}.wikipedia.org/wiki/{page_path}"
+            fetched.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "domain": f"{lang}.wikipedia.org",
+                    "snippet": snippet,
+                }
+            )
+
+        return fetched
+
+    try:
+        results = _fetch("ja")
+        if not results:
+            results = _fetch("en")
+    except Exception:
+        return []
+
+    return results[:limit]
+
+
+
+
+
+def _derive_query_keywords(query: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+|[?-??-??-?]{2,}", query or "")
+    stopwords = {
+        "??", "????", "??", "???", "????", "???", "???", "??", "??", "??",
+        "?", "??", "??", "??", "???", "????", "Web", "web", "???", "???????",
+        "????", "??", "???", "???", "??", "????",
+    }
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        normalized = token.lower()
+        if len(normalized) < 2:
+            continue
+        if normalized in stopwords:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        keywords.append(token)
+    return keywords[:8]
+
+
+
+def _score_search_result_for_deep_fetch(item: dict[str, str], query_keywords: list[str], index: int) -> int:
+    title = item.get("title", "")
+    snippet = item.get("snippet", "")
+    domain = item.get("domain", "")
+
+    score = max(0, 12 - index)
+
+    title_lower = title.lower()
+    snippet_lower = snippet.lower()
+    domain_lower = domain.lower()
+
+    if query_keywords and any(keyword.lower() in title_lower for keyword in query_keywords):
+        score += 5
+    if query_keywords and any(keyword.lower() in snippet_lower for keyword in query_keywords):
+        score += 4
+    if domain_lower.endswith((".go.jp", ".gov", ".ac.jp")):
+        score += 4
+    if any(host in domain_lower for host in ("jma.go.jp", "noaa.gov", "nhk.or.jp", "weathernews.jp", "yahoo.co.jp")):
+        score += 3
+    if snippet:
+        score += 1
+
+    return score
+
+
+
+def _select_top_search_results(results: list[dict[str, str]], query: str, limit: int = 3) -> list[dict[str, str]]:
+    keywords = _derive_query_keywords(query)
+    ranked: list[tuple[int, int, dict[str, str]]] = []
+    for index, item in enumerate(results):
+        ranked.append((_score_search_result_for_deep_fetch(item, keywords, index), index, item))
+
+    ranked.sort(key=lambda pair: (pair[0], -pair[1]), reverse=True)
+    selected = [item for score, _, item in ranked if score > 0]
+    if not selected:
+        selected = [item for _, _, item in ranked]
+    return selected[:limit]
+
+
+
+
+def _clean_summary_text(text: str) -> str:
+    if not text:
+        return ""
+
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.search(r'^(?:????|Language warning|WARNING|NOTE:)', line, re.IGNORECASE):
+            continue
+        lines.append(line)
+
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+
+def _summarize_page_text(text: str, query: str, max_length: int = 700) -> str:
+    cleaned = _clean_summary_text(text)
+    if not cleaned:
+        return ""
+
+    raw_chunks = re.split(r'(?<=[???!?])\s+|[\r\n]+', cleaned)
+    chunks: list[str] = []
+    for raw_chunk in raw_chunks:
+        chunk = re.sub(r"\s+", " ", raw_chunk).strip()
+        if len(chunk) < 18:
+            continue
+        if _is_navigation_or_footer_noise(chunk):
+            continue
+        chunks.append(chunk)
+
+    if not chunks:
+        normalized = re.sub(r"\s+", " ", cleaned).strip()
+        return _truncate_text(normalized, max_length)
+
+    keywords = _derive_query_keywords(query)
+    scored: list[tuple[int, int, str]] = []
+    for index, chunk in enumerate(chunks):
+        score = 0
+        chunk_lower = chunk.lower()
+        for keyword in keywords:
+            if keyword.lower() in chunk_lower:
+                score += 3
+        if _contains_japanese(chunk):
+            score += 1
+        score += min(len(chunk) // 120, 3)
+        scored.append((score, index, chunk))
+
+    scored.sort(key=lambda pair: (pair[0], -pair[1]), reverse=True)
+    picked: list[tuple[int, str]] = []
+    for score, index, chunk in scored:
+        if score <= 0 and picked:
+            continue
+        picked.append((index, chunk))
+        if len(picked) >= 4:
+            break
+
+    if not picked:
+        picked = list(enumerate(chunks[:4]))
+
+    picked.sort(key=lambda pair: pair[0])
+    summary = " ".join(chunk for _, chunk in picked)
+    summary = re.sub(r"\s+", " ", summary).strip()
+    return _truncate_text(summary, max_length)
+
+
+
+def _fetch_url_summary(url: str, query: str, max_length: int = 2500) -> dict[str, str]:
+    try:
+        page_text = fetch_url(url, max_length=max_length)
+        cleaned = _clean_summary_text(page_text)
+        summary = _summarize_page_text(cleaned, query, max_length=700)
+        if not summary:
+            summary = _truncate_text(cleaned, 700)
+        return {
+            "status": "ok",
+            "summary": summary,
+            "excerpt": _truncate_text(cleaned, 1200),
+        }
+    except Exception as err:
+        return {
+            "status": "error",
+            "summary": "",
+            "excerpt": "",
+            "error": str(err),
+        }
+
+
+def _format_search_results(query: str, results: list[dict[str, str]]) -> str:
+    """??????????????????"""
+    lines = [f"????: {query}", ""]
+    for index, item in enumerate(results, 1):
+        title = item.get("title", "")
+        url = item.get("url", "")
+        domain = item.get("domain", "")
+        snippet = item.get("snippet", "")
+
+        lines.append(f"{index}. {title}")
+        if domain:
+            lines.append(f"???: {domain}")
+        if url:
+            lines.append(f"URL: {url}")
+        if snippet:
+            lines.append(f"??: {snippet}")
+        lines.append("")
+
+    return "\\n".join(lines).rstrip()
+
+
+def _contains_japanese(text: str) -> bool:
+    """??????????????????"""
+    return bool(re.search(r"[?-??-??-?]", text or ""))
+
+
+def _prefer_japanese_results(results: list[dict[str, str]], limit: int = 5) -> list[dict[str, str]]:
+    """????????????????"""
+    ranked: list[tuple[int, dict[str, str]]] = []
+    for item in results:
+        title = item.get("title", "")
+        snippet = item.get("snippet", "")
+        domain = item.get("domain", "")
+        score = 0
+        if _contains_japanese(title):
+            score += 3
+        if _contains_japanese(snippet):
+            score += 2
+        if _contains_japanese(domain):
+            score += 1
+        ranked.append((score, item))
+
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    preferred = [item for score, item in ranked if score > 0]
+    return (preferred or results)[:limit]
+
+
+def _truncate_text(text: str, max_length: int) -> str:
+    """????????????????????"""
+    if not text:
+        return ""
+    if max_length <= 0:
+        return text
+    if len(text) <= max_length:
+        return text
+    suffix = "\n... (??)"
+    if max_length <= len(suffix):
+        return text[:max_length]
+    return text[: max_length - len(suffix)].rstrip() + suffix
+
+
+def _maybe_save_search_web_json(payload: dict, suffix: str = "") -> None:
+    """調査用: search_web の JSON ペイロードをローカル保存する。"""
+    # 既定は有効。無効化する場合は FETCH_DEBUG_SAVE_JSON=0 を設定。
+    enabled = os.getenv("FETCH_DEBUG_SAVE_JSON", "1").strip().lower() not in {"0", "false", "off", "no"}
+    if not enabled:
+        return
+
+    try:
+        output_dir = Path(os.getenv("FETCH_DEBUG_DIR", str(Path(__file__).resolve().parent / "debug-json")))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        suffix_part = f"_{suffix}" if suffix else ""
+        output_path = output_dir / f"search_web{suffix_part}_{stamp}.json"
+
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # デバッグ保存の失敗で本処理は止めない
+        pass
+
+
+def _maybe_log_search_web_debug(stage: str, payload: dict) -> None:
+    """調査用: search_web の各段階をログと JSON に出力する。"""
+    enabled = os.getenv("FETCH_DEBUG_LOG_SEARCH_WEB", "1").strip().lower() not in {"0", "false", "off", "no"}
+    if not enabled:
+        return
+
+    try:
+        _LOGGER.warning("[search_web:%s] %s", stage, json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        pass
+
+    _maybe_save_search_web_json({"stage": stage, **payload}, suffix=stage)
+
+
+
+def _safe_truncate(text: str, limit: int) -> str:
+    text = text or ""
+    if limit <= 0:
+        return ""
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _safe_log_search_web_debug(stage: str, payload: dict) -> None:
+    try:
+        _maybe_log_search_web_debug(stage, payload)
+    except Exception:
+        pass
+
+
+def _safe_save_search_web_json(payload: dict, suffix: str | None = None) -> None:
+    try:
+        if suffix:
+            _maybe_save_search_web_json(payload, suffix=suffix)
+        else:
+            _maybe_save_search_web_json(payload)
+    except Exception:
+        pass
+
+
+def _is_safe_fetch_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+
+        blocked_hosts = {
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+            "::1",
+        }
+
+        if host in blocked_hosts:
+            return False
+
+        if host.startswith("10.") or host.startswith("192.168."):
+            return False
+
+        if host.startswith("172."):
+            parts = host.split(".")
+            if len(parts) >= 2 and parts[1].isdigit():
+                if 16 <= int(parts[1]) <= 31:
+                    return False
+
+        return True
+    except Exception:
+        return False
+
 @mcp.tool()
 def search_web(query: str, max_length: int = 5000) -> str:
-    """
-    キーワードでWeb検索し、検索結果ページの内容を取得する
-
-    Args:
-        query: 検索キーワード
-        max_length: 取得コンテンツの最大文字数（デフォルト: 5000）
-
-    Returns:
-        検索結果ページのテキスト
-    """
+    """Search web pages and return structured JSON with fetched summaries."""
     try:
-        q = (query or "").strip()
+        original_q = (query or "").strip()
+        q = _sanitize_search_query(original_q)
+        max_length = max(500, int(max_length or 5000))
+
         if not q:
-            return "エラー: query が空です"
+            return json.dumps(
+                {
+                    "query": "",
+                    "engine": "duckduckgo",
+                    "results": [],
+                    "notes": ["query is empty"],
+                },
+                ensure_ascii=False,
+            )
 
-        # HTML版を使って軽量に取得
-        url = f"https://duckduckgo.com/html/?q={urllib.parse.quote_plus(q)}"
-        return fetch_url(url=url, max_length=max_length)
-    except Exception as e:
-        return f"検索エラー: {e}"
+        search_url = f"https://duckduckgo.com/html/?q={urllib.parse.quote_plus(q)}&kl=jp-ja"
 
+        _safe_log_search_web_debug(
+            "query",
+            {
+                "query": q,
+                "original_query": original_q,
+                "search_url": search_url,
+                "max_length": max_length,
+            },
+        )
+
+        raw_html = _fetch_raw_html(search_url)
+        challenge_detected = _is_search_challenge_page(raw_html)
+        results = _extract_duckduckgo_results(raw_html, limit=10)
+        used_fallback = False
+
+        if not results and challenge_detected:
+            wiki_results = _search_wikipedia_results(q, limit=10)
+            if wiki_results:
+                results = wiki_results
+                used_fallback = True
+
+        results = _prefer_japanese_results(results, limit=10)
+        selected_results = _select_top_search_results(results, q, limit=3)
+
+        page_title_match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.IGNORECASE | re.DOTALL)
+        page_title = _strip_html_tags(page_title_match.group(1)) if page_title_match else ""
+
+        _safe_log_search_web_debug(
+            "results",
+            {
+                "query": q,
+                "original_query": original_q,
+                "search_url": search_url,
+                "raw_html_length": len(raw_html),
+                "page_title": page_title,
+                "challenge_detected": challenge_detected,
+                "used_fallback": used_fallback,
+                "has_result_anchor": ("result__a" in raw_html) or ("result-link" in raw_html),
+                "result_count": len(results),
+                "selected_count": len(selected_results),
+                "results": results,
+                "selected_results": selected_results,
+            },
+        )
+
+        enriched_results: list[dict[str, str]] = []
+
+        if selected_results:
+            safe_selected_results = [
+                item for item in selected_results
+                if _is_safe_fetch_url(item.get("url", ""))
+            ]
+
+            max_workers = min(3, len(safe_selected_results))
+            summaries: dict[int, dict[str, str]] = {}
+
+            if max_workers > 0:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_index = {
+                        executor.submit(_fetch_url_summary, item.get("url", ""), q): index
+                        for index, item in enumerate(safe_selected_results)
+                    }
+
+                    for future in as_completed(future_to_index):
+                        index = future_to_index[future]
+                        try:
+                            summaries[index] = future.result()
+                        except Exception as err:
+                            summaries[index] = {
+                                "status": "error",
+                                "summary": "",
+                                "excerpt": "",
+                                "error": str(err),
+                            }
+
+            safe_url_to_summary = {
+                item.get("url", ""): summaries.get(index, {
+                    "status": "error",
+                    "summary": "",
+                    "excerpt": "",
+                })
+                for index, item in enumerate(safe_selected_results)
+            }
+
+            for index, item in enumerate(selected_results, 1):
+                url = item.get("url", "")
+
+                if not _is_safe_fetch_url(url):
+                    summary_info = {
+                        "status": "blocked_url",
+                        "summary": "",
+                        "excerpt": "",
+                    }
+                else:
+                    summary_info = safe_url_to_summary.get(url, {
+                        "status": "error",
+                        "summary": "",
+                        "excerpt": "",
+                    })
+
+                enriched_results.append(
+                    {
+                        "rank": str(index),
+                        "title": _safe_truncate(item.get("title", ""), 300),
+                        "url": url,
+                        "domain": item.get("domain", ""),
+                        "snippet": _safe_truncate(item.get("snippet", ""), 1000),
+                        "page_summary": _safe_truncate(
+                            summary_info.get("summary", ""),
+                            max_length,
+                        ),
+                        "page_excerpt": _safe_truncate(
+                            summary_info.get("excerpt", ""),
+                            min(max_length, 2000),
+                        ),
+                        "page_summary_status": summary_info.get("status", "error"),
+                    }
+                )
+
+        notes: list[str] = []
+
+        if not results:
+            notes.append("検索結果が見つかりませんでした")
+            if challenge_detected:
+                notes.append("検索エンジンの challenge ページを検出しました")
+        elif not selected_results:
+            notes.append("検索結果はありましたが、取得対象を選択できませんでした")
+        elif not enriched_results:
+            notes.append("取得対象のページ本文を取得できませんでした")
+
+        if used_fallback:
+            notes.append("DuckDuckGo challenge 回避のため Wikipedia API フォールバックを使用しました")
+
+        payload = {
+            "query": q,
+            "original_query": original_q,
+            "engine": "duckduckgo+wikipedia" if used_fallback else "duckduckgo",
+            "search_url": search_url,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "challenge_detected": challenge_detected,
+            "used_fallback": used_fallback,
+            "result_count": len(results),
+            "selected_count": len(enriched_results),
+            "results": enriched_results,
+            "notes": notes,
+        }
+
+        _safe_log_search_web_debug("final", payload)
+        _safe_save_search_web_json(payload)
+
+        return json.dumps(payload, ensure_ascii=False)
+
+    except Exception as err:
+        error_payload = {
+            "query": query or "",
+            "engine": "duckduckgo",
+            "results": [],
+            "notes": [f"error: {err}"],
+        }
+
+        _safe_log_search_web_debug("error", error_payload)
+        _safe_save_search_web_json(error_payload, suffix="error")
+
+        return json.dumps(error_payload, ensure_ascii=False)
 
 @mcp.tool()
 def search_files(directory: str, pattern: str, max_results: int = 20) -> str:
